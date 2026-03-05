@@ -173,7 +173,10 @@ async function hubFetch(
     }
 
     const body = await resp.text().catch(() => "");
-    throw new Error(`HXA-Connect ${path} failed: ${resp.status} ${body}`);
+    const err = new Error(`HXA-Connect ${path} failed: ${resp.status} ${body}`);
+    (err as any).status = resp.status;
+    (err as any).responseBody = body;
+    throw err;
   }
   throw new Error(`HXA-Connect ${path} failed: exhausted retries`);
 }
@@ -200,17 +203,36 @@ async function sendToThread(
   acct: HxaAccountConfig,
   threadId: string,
   text: string,
+  options?: { replyTo?: string },
 ): Promise<{ ok: boolean; messageId?: string }> {
   if (!acct.hubUrl || !acct.agentToken) {
     throw new Error("HXA-Connect not configured (missing hubUrl or agentToken)");
   }
   assertSafePathSegment(threadId, "thread_id");
-  const resp = await hubFetch(acct, `/api/threads/${threadId}/messages`, {
-    method: "POST",
-    body: JSON.stringify({ content: text, content_type: "text" }),
-  });
-  const result = (await resp.json()) as any;
-  return { ok: true, messageId: result?.message?.id };
+  const body: Record<string, string> = { content: text, content_type: "text" };
+  if (options?.replyTo) body.reply_to = options.replyTo;
+
+  try {
+    const resp = await hubFetch(acct, `/api/threads/${threadId}/messages`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    });
+    const result = (await resp.json()) as any;
+    return { ok: true, messageId: result?.message?.id };
+  } catch (err: any) {
+    // If reply_to fails (message deleted/invalid), retry without it
+    if (options?.replyTo && (err?.status === 400 || err?.status === 404)) {
+      console.warn(`[hxa-connect] reply_to ${options.replyTo} failed (${err?.status}), sending without reply`);
+      const fallbackBody = { content: text, content_type: "text" };
+      const resp = await hubFetch(acct, `/api/threads/${threadId}/messages`, {
+        method: "POST",
+        body: JSON.stringify(fallbackBody),
+      });
+      const result = (await resp.json()) as any;
+      return { ok: true, messageId: result?.message?.id };
+    }
+    throw err;
+  }
 }
 
 /** Route an outbound message to the correct destination (thread, channel, or DM). */
@@ -218,16 +240,17 @@ async function routeOutboundMessage(
   acct: HxaAccountConfig,
   target: string,
   text: string,
+  options?: { replyTo?: string },
 ): Promise<{ ok: boolean; messageId?: string }> {
   // Case-insensitive thread: prefix
   if (/^thread:/i.test(target)) {
-    return sendToThread(acct, target.slice("thread:".length), text);
+    return sendToThread(acct, target.slice("thread:".length), text, options);
   }
   // UUID — probe if it's a thread, fall back to DM
   if (UUID_RE.test(target)) {
     try {
       await hubFetch(acct, `/api/threads/${target}`, { method: "GET" });
-      return await sendToThread(acct, target, text);
+      return await sendToThread(acct, target, text, options);
     } catch {
       return await sendDM(acct, target, text);
     }
@@ -445,6 +468,15 @@ async function connectAccount(
       );
     }
 
+    // Reply-to context (like TG's replying-to format)
+    if (message.reply_to_message) {
+      const reply = message.reply_to_message;
+      const replySender = (reply.sender_name || reply.sender_id || "unknown").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+      // Escape all < and > in reply content to prevent tag injection
+      const replyContent = (reply.content || "").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+      parts.push(`<replying-to>\n[${replySender}]: ${replyContent}\n</replying-to>\n\n`);
+    }
+
     // Current message
     parts.push(`<current-message>\n${content}\n</current-message>`);
 
@@ -461,6 +493,11 @@ async function connectAccount(
       chatType: "group",
       groupSubject: `thread:${threadId}`,
       replyTarget: `thread:${threadId}`,
+      replyToMessageId: message.id,
+      ...(message.reply_to_message ? {
+        replyToBody: message.reply_to_message.content || "",
+        replyToSender: message.reply_to_message.sender_name || message.reply_to_message.sender_id || "unknown",
+      } : {}),
       displayPrefix: dp,
     });
   });
@@ -643,6 +680,9 @@ interface InboundParams {
   chatType: "direct" | "group";
   groupSubject?: string;
   replyTarget: string; // bot name for DM, "thread:<id>" for threads
+  replyToMessageId?: string; // message ID for reply-to on outbound
+  replyToBody?: string; // reply-to message content (for context)
+  replyToSender?: string; // reply-to sender name (for context)
   displayPrefix: string;
 }
 
@@ -702,6 +742,9 @@ async function dispatchInbound(params: InboundParams) {
     OriginatingChannel: "hxa-connect" as const,
     OriginatingTo: to,
     ConversationLabel: chatType === "group" ? (groupSubject || senderName) : senderName,
+    ...(params.replyToMessageId ? { ReplyToId: params.replyToMessageId } : {}),
+    ...(params.replyToBody ? { ReplyToBody: params.replyToBody } : {}),
+    ...(params.replyToSender ? { ReplyToSender: params.replyToSender } : {}),
   });
 
   const acct = resolveAccountConfig(cfg, accountId);
@@ -721,7 +764,9 @@ async function dispatchInbound(params: InboundParams) {
 
         try {
           if (threadId) {
-            await sendToThread(acct, threadId, text);
+            await sendToThread(acct, threadId, text, {
+              replyTo: params.replyToMessageId,
+            });
           } else {
             await sendDM(acct, replyTarget, text);
           }
@@ -803,9 +848,12 @@ const hxaConnectChannel = {
       to: string;
       text: string;
       accountId?: string;
+      replyToId?: string;
     }) => {
       const acct = resolveAccountConfig(params.cfg, params.accountId);
-      const result = await routeOutboundMessage(acct, params.to, params.text);
+      const result = await routeOutboundMessage(acct, params.to, params.text, {
+        replyTo: params.replyToId,
+      });
       return { channel: "hxa-connect" as const, ...result };
     },
     sendMedia: async (params: {
@@ -814,15 +862,17 @@ const hxaConnectChannel = {
       text: string;
       mediaUrl?: string;
       accountId?: string;
+      replyToId?: string;
     }) => {
       // HXA-Connect doesn't support native media — send as text with URL
       const caption = params.text || "";
       const mediaUrl = params.mediaUrl || "";
       const text = [caption, mediaUrl].filter(Boolean).join("\n");
       const acct = resolveAccountConfig(params.cfg, params.accountId);
-      const target = params.to;
 
-      const result = await routeOutboundMessage(acct, target, text);
+      const result = await routeOutboundMessage(acct, params.to, text, {
+        replyTo: params.replyToId,
+      });
       return { channel: "hxa-connect" as const, ...result };
     },
   },
