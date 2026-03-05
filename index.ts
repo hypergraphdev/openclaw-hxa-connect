@@ -213,6 +213,33 @@ async function sendToThread(
   return { ok: true, messageId: result?.message?.id };
 }
 
+/** Route an outbound message to the correct destination (thread, channel, or DM). */
+async function routeOutboundMessage(
+  acct: HxaAccountConfig,
+  target: string,
+  text: string,
+): Promise<{ ok: boolean; messageId?: string }> {
+  // Case-insensitive thread: prefix
+  if (/^thread:/i.test(target)) {
+    return sendToThread(acct, target.slice("thread:".length), text);
+  }
+  // UUID — probe if it's a thread, fall back to DM
+  if (UUID_RE.test(target)) {
+    try {
+      await hubFetch(acct, `/api/threads/${target}`, { method: "GET" });
+      return await sendToThread(acct, target, text);
+    } catch {
+      return await sendDM(acct, target, text);
+    }
+  }
+  // Channel ID
+  if (CHANNEL_ID_RE.test(target) && target.length > 20) {
+    return sendToChannel(acct, target, text);
+  }
+  // Default: DM by bot name
+  return sendDM(acct, target, text);
+}
+
 /** Send a message to a specific channel by ID. */
 async function sendToChannel(
   acct: HxaAccountConfig,
@@ -733,6 +760,22 @@ const hxaConnectChannel = {
     edit: false,
     reply: false,
   },
+  messaging: {
+    targetResolver: {
+      hint: 'Use bot name for DMs (e.g. "zylos01") or "thread:<uuid>" for threads',
+      looksLikeId: (raw: string, _normalized?: string): boolean => {
+        const trimmed = raw.trim();
+        if (!trimmed) return false;
+        // thread:<uuid> format
+        if (/^thread:/i.test(trimmed)) return true;
+        // UUID format (could be a thread or channel ID)
+        if (UUID_RE.test(trimmed)) return true;
+        // For HXA-Connect, any non-empty string is a valid target
+        // (bot name for DM, or other identifier) — sendText handles resolution
+        return true;
+      },
+    },
+  },
   config: {
     listAccountIds: (cfg: any) => {
       const hxa = resolveHxaConnectConfig(cfg);
@@ -762,29 +805,24 @@ const hxaConnectChannel = {
       accountId?: string;
     }) => {
       const acct = resolveAccountConfig(params.cfg, params.accountId);
+      const result = await routeOutboundMessage(acct, params.to, params.text);
+      return { channel: "hxa-connect" as const, ...result };
+    },
+    sendMedia: async (params: {
+      cfg: any;
+      to: string;
+      text: string;
+      mediaUrl?: string;
+      accountId?: string;
+    }) => {
+      // HXA-Connect doesn't support native media — send as text with URL
+      const caption = params.text || "";
+      const mediaUrl = params.mediaUrl || "";
+      const text = [caption, mediaUrl].filter(Boolean).join("\n");
+      const acct = resolveAccountConfig(params.cfg, params.accountId);
       const target = params.to;
 
-      let result;
-      if (target.startsWith("thread:")) {
-        result = await sendToThread(acct, target.slice("thread:".length), params.text);
-      } else if (UUID_RE.test(target)) {
-        // Might be a thread ID — try thread first, fall back to DM
-        try {
-          const resp = await hubFetch(acct, `/api/threads/${target}`, { method: "GET" });
-          if (resp.ok) {
-            result = await sendToThread(acct, target, params.text);
-          } else {
-            result = await sendDM(acct, target, params.text);
-          }
-        } catch {
-          result = await sendDM(acct, target, params.text);
-        }
-      } else if (CHANNEL_ID_RE.test(target) && target.length > 20) {
-        result = await sendToChannel(acct, target, params.text);
-      } else {
-        result = await sendDM(acct, target, params.text);
-      }
-
+      const result = await routeOutboundMessage(acct, target, text);
       return { channel: "hxa-connect" as const, ...result };
     },
   },
@@ -988,7 +1026,10 @@ Commands:
   Thread ops: thread-create, thread-update, thread-join, thread-leave, thread-invite
   Artifacts: artifact-add, artifact-update, artifact-list, artifact-versions
   Profile: profile-update, rename
-  Admin: role, ticket-create, rotate-secret`,
+  Admin: role, ticket-create, rotate-secret
+
+To send messages, use the message tool: message(action="send", channel="hxa-connect", target="bot_name" or "thread:<id>", message="...")
+Important: In threads, @mention the target bot in your message text (e.g. "@bot_name hello") — bots in mention mode only receive messages where they are @mentioned.`,
     parameters: {
       type: "object",
       properties: {
