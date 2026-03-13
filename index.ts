@@ -1,5 +1,7 @@
 import type { OpenClawPluginApi, PluginRuntime } from "openclaw/plugin-sdk";
 import { emptyPluginConfigSchema } from "openclaw/plugin-sdk";
+import fs from "fs";
+import path from "path";
 
 // ─── Runtime singleton ───────────────────────────────────────
 let pluginRuntime: PluginRuntime | null = null;
@@ -446,7 +448,7 @@ function formatBytes(bytes: unknown): string {
 // complex objects not suitable for inline display — both are skipped here.
 const MAX_ATTACHMENT_PARTS = 20;
 
-function formatAttachments(parts: any[] | undefined | null): string {
+function formatAttachments(parts: any[] | undefined | null, localPaths?: Record<string, string>): string {
   if (!parts || !parts.length) return "";
   const refs: string[] = [];
   let truncated = 0;
@@ -460,16 +462,19 @@ function formatAttachments(parts: any[] | undefined | null): string {
       continue;
     }
     switch (part.type) {
-      case "image":
+      case "image": {
         if (!part.url) break;
+        const loc = localPaths?.[part.url];
         refs.push(part.alt
-          ? `[image: ${part.alt} — ${part.url}]`
-          : `[image: ${part.url}]`);
+          ? `[image: ${part.alt} — ${loc || part.url}]`
+          : `[image: ${loc || part.url}]`);
         break;
+      }
       case "file": {
         if (!part.url || !part.name) break;
         const size = part.size != null ? `, ${formatBytes(part.size)}` : "";
-        refs.push(`[file: ${part.name} (${part.mime_type || "application/octet-stream"}${size}) — ${part.url}]`);
+        const loc = localPaths?.[part.url];
+        refs.push(`[file: ${part.name} (${part.mime_type || "application/octet-stream"}${size}) — ${loc || part.url}]`);
         break;
       }
       case "link":
@@ -488,6 +493,108 @@ function formatAttachments(parts: any[] | undefined | null): string {
   }
   if (truncated > 0) refs.push(`[... and ${truncated} more]`);
   return refs.length > 0 ? "\n" + refs.join("\n") : "";
+}
+
+// ─── Media Download ─────────────────────────────────────────
+
+const DEFAULT_MEDIA_MAX_BYTES = 10 * 1024 * 1024; // 10 MB
+const MEDIA_DOWNLOAD_TIMEOUT = 30000; // 30 seconds
+
+const MIME_TO_EXT: Record<string, string> = {
+  "image/jpeg": ".jpg",
+  "image/png": ".png",
+  "image/gif": ".gif",
+  "image/webp": ".webp",
+  "application/pdf": ".pdf",
+  "text/plain": ".txt",
+  "text/csv": ".csv",
+  "application/json": ".json",
+};
+
+// Match Hub-internal file URLs: /api/files/<uuid>
+const HUB_FILE_RE = /^\/api\/files\/([a-f0-9-]+)$/i;
+
+/**
+ * Download media parts (image/file) from Hub to local filesystem.
+ * Returns a map of original URL → local file path.
+ * Only downloads Hub-internal URLs (/api/files/:id); external URLs are skipped.
+ */
+async function downloadMediaParts(
+  parts: any[] | undefined | null,
+  hubUrl: string,
+  token: string,
+  mediaDir: string,
+  lp: string,
+): Promise<Record<string, string>> {
+  if (!parts || !parts.length) return {};
+
+  const localPaths: Record<string, string> = {};
+  await fs.promises.mkdir(mediaDir, { recursive: true });
+
+  for (const part of parts) {
+    if (part.type !== "image" && part.type !== "file") continue;
+    if (!part.url) continue;
+
+    const match = HUB_FILE_RE.exec(part.url);
+    if (!match) continue; // External URL, skip
+
+    const fileId = match[1];
+
+    try {
+      const fullUrl = `${hubUrl}/api/files/${fileId}`;
+      const res = await fetch(fullUrl, {
+        headers: { "Authorization": `Bearer ${token}` },
+        signal: AbortSignal.timeout(MEDIA_DOWNLOAD_TIMEOUT),
+      });
+
+      if (!res.ok) {
+        console.warn(`${lp} Media download failed: ${fullUrl} → ${res.status}`);
+        await res.body?.cancel();
+        continue;
+      }
+
+      // Check content-length before downloading full body
+      const clHeader = res.headers.get("content-length");
+      if (clHeader && parseInt(clHeader, 10) > DEFAULT_MEDIA_MAX_BYTES) {
+        console.warn(`${lp} Media too large (${formatBytes(parseInt(clHeader, 10))}), skipping: ${fileId}`);
+        await res.body?.cancel();
+        continue;
+      }
+
+      // Stream body with size guard to prevent OOM on missing Content-Length
+      const chunks: Buffer[] = [];
+      let totalBytes = 0;
+      let aborted = false;
+      for await (const chunk of res.body!) {
+        totalBytes += chunk.length;
+        if (totalBytes > DEFAULT_MEDIA_MAX_BYTES) {
+          console.warn(`${lp} Media exceeded limit during download (>${formatBytes(DEFAULT_MEDIA_MAX_BYTES)}), aborting: ${fileId}`);
+          aborted = true;
+          break; // for-await cleanup cancels the stream
+        }
+        chunks.push(Buffer.from(chunk));
+      }
+      if (aborted) continue;
+
+      const buffer = Buffer.concat(chunks);
+
+      // Determine extension from response content-type
+      const contentType = (res.headers.get("content-type") || "").split(";")[0].trim();
+      const ext = MIME_TO_EXT[contentType] || "";
+      const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+      const filename = `${timestamp}-${fileId.substring(0, 8)}${ext}`;
+
+      const localPath = path.join(mediaDir, filename);
+      await fs.promises.writeFile(localPath, buffer);
+
+      localPaths[part.url] = localPath;
+      console.log(`${lp} Media saved: ${localPath} (${formatBytes(buffer.length)})`);
+    } catch (err: any) {
+      console.warn(`${lp} Media download error for ${part.url}: ${err.message}`);
+    }
+  }
+
+  return localPaths;
 }
 
 /** Escape &, <, > to prevent tag injection inside XML-structured messages. */
@@ -556,29 +663,39 @@ async function connectAccount(
   const access = acct.access || {};
 
   // ─── DM Handler ──────────────────────────────────────────
-  client.on("message", (msg: any) => {
-    const sender = msg.sender_name || "unknown";
-    const content = msg.message?.content || msg.content || "";
-    if (isSelf(msg.message?.sender_id, msg.message?.metadata)) return;
-    const attachments = formatAttachments(msg.message?.parts || msg.parts);
+  const mediaDir = path.join(getRuntime().dataDir, "media", accountId);
 
-    if (!isDmAllowed(access, sender)) {
-      log?.info?.(`${lp} DM from ${sender} rejected (dmPolicy: ${access.dmPolicy || "open"})`);
-      return;
+  client.on("message", async (msg: any) => {
+    try {
+      const sender = msg.sender_name || "unknown";
+      const content = msg.message?.content || msg.content || "";
+      if (isSelf(msg.message?.sender_id, msg.message?.metadata)) return;
+
+      if (!isDmAllowed(access, sender)) {
+        log?.info?.(`${lp} DM from ${sender} rejected (dmPolicy: ${access.dmPolicy || "open"})`);
+        return;
+      }
+
+      // Download media after policy checks to avoid wasted effort
+      const msgParts = msg.message?.parts || msg.parts;
+      const localPaths = await downloadMediaParts(msgParts, acct.hubUrl!, acct.agentToken!, mediaDir, lp);
+      const attachments = formatAttachments(msgParts, localPaths);
+
+      log?.info?.(`${lp} DM from ${sender}: ${content.substring(0, 80)}`);
+      dispatchInbound({
+        cfg,
+        accountId,
+        senderName: sender,
+        senderId: msg.message?.sender_id || sender,
+        content: content + attachments,
+        messageId: msg.message?.id,
+        chatType: "direct",
+        replyTarget: sender,
+        displayPrefix: dp,
+      });
+    } catch (err: any) {
+      console.error(`${lp} DM handler error: ${err.message}`);
     }
-
-    log?.info?.(`${lp} DM from ${sender}: ${content.substring(0, 80)}`);
-    dispatchInbound({
-      cfg,
-      accountId,
-      senderName: sender,
-      senderId: msg.message?.sender_id || sender,
-      content: content + attachments,
-      messageId: msg.message?.id,
-      chatType: "direct",
-      replyTarget: sender,
-      displayPrefix: dp,
-    });
   });
 
   // ─── Thread Handlers ─────────────────────────────────────
@@ -629,10 +746,9 @@ async function connectAccount(
     return botName;
   }
 
-  threadCtx.onMention(({ threadId, message, snapshot }: any) => {
+  threadCtx.onMention(async ({ threadId, message, snapshot }: any) => {
     const sender = msgSender(message);
     const content = message.content || "";
-    const attachments = formatAttachments(message.parts);
 
     if (!isThreadAllowed(access, threadId)) {
       log?.info?.(
@@ -652,10 +768,14 @@ async function connectAccount(
       return;
     }
 
+    // Download media for trigger message (after policy checks)
+    const localPaths = await downloadMediaParts(message.parts, acct.hubUrl!, acct.agentToken!, mediaDir, lp);
+    const attachments = formatAttachments(message.parts, localPaths);
+
     // Build message with XML tags (consistent with Lark/TG format)
     const parts: string[] = [`[${dp} Thread:${threadId}] ${sender} said: `];
 
-    // Thread context: previous messages (excluding trigger)
+    // Thread context: previous messages (excluding trigger) — no media download for context
     const contextMsgs = (snapshot.newMessages || []).filter((m: any) => m.id !== message.id);
     if (contextMsgs.length > 0) {
       const lines = contextMsgs.map((m: any) => {
@@ -681,7 +801,7 @@ async function connectAccount(
       parts.push(`<replying-to>\n[${replySender}]: ${replyContent}${replyAtt}\n</replying-to>\n\n`);
     }
 
-    // Current message (includes non-text attachments: image, file, link)
+    // Current message (includes non-text attachments with local paths when downloaded)
     parts.push(`<current-message>\n${escapeXml(content)}${escapeXml(attachments)}\n</current-message>`);
 
     const formattedContent = parts.join("");
@@ -1257,8 +1377,16 @@ async function handleInboundWebhook(req: any, res: any) {
 
   console.log(`[hxa-connect] inbound from ${sender_name}: ${content.slice(0, 100)}`);
 
+  // Download media parts from Hub to local filesystem (same as WS path)
+  const whLp = `[hxa-connect:${matchedAccountId}]`;
+  let localPaths: Record<string, string> = {};
+  if (acct?.hubUrl && acct?.agentToken) {
+    const whMediaDir = path.join(getRuntime().dataDir, "media", matchedAccountId);
+    localPaths = await downloadMediaParts(message_parts, acct.hubUrl, acct.agentToken, whMediaDir, whLp);
+  }
+
   // Format non-text attachments from message parts
-  const webhookAttachments = formatAttachments(message_parts);
+  const webhookAttachments = formatAttachments(message_parts, localPaths);
 
   // Inject reply-to context (matching WS path behavior)
   let finalContent = content + webhookAttachments;
