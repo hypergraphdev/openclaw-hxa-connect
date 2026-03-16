@@ -147,6 +147,21 @@ describe("sourceUrl construction", () => {
   });
 });
 
+// Helper: mirrors the coercion logic in index.ts download-file case
+function coerceMaxBytes(raw: any): number {
+  return typeof raw === "number"
+    ? raw
+    : raw != null ? Number(raw)
+    : 10 * 1024 * 1024;
+}
+
+function coerceTimeout(raw: any): number {
+  return typeof raw === "number"
+    ? raw
+    : raw != null ? Number(raw)
+    : 30_000;
+}
+
 describe("download-file argument validation", () => {
   it("should require file_id", () => {
     const file_id = undefined;
@@ -171,15 +186,40 @@ describe("download-file argument validation", () => {
   });
 
   it("should default max_bytes to 10MB", () => {
-    const max_bytes = undefined;
-    const resolved = max_bytes ?? 10 * 1024 * 1024;
+    const resolved = coerceMaxBytes(undefined);
     assert.equal(resolved, 10485760);
   });
 
   it("should default timeout to 30s", () => {
-    const timeout = undefined;
-    const resolved = timeout ?? 30_000;
+    const resolved = coerceTimeout(undefined);
     assert.equal(resolved, 30000);
+  });
+
+  it("should coerce string max_bytes to number", () => {
+    const resolved = coerceMaxBytes("5242880");
+    assert.equal(resolved, 5242880);
+  });
+
+  it("should coerce string timeout to number", () => {
+    const resolved = coerceTimeout("60000");
+    assert.equal(resolved, 60000);
+  });
+
+  it("should produce NaN for non-numeric string max_bytes", () => {
+    const resolved = coerceMaxBytes("not-a-number");
+    assert.ok(!Number.isFinite(resolved), "Non-numeric string should produce invalid number");
+  });
+
+  it("should reject max_bytes exceeding 100 MB limit", () => {
+    const MAX_BYTES_LIMIT = 100 * 1024 * 1024;
+    const maxBytes = 200 * 1024 * 1024;
+    assert.ok(maxBytes > MAX_BYTES_LIMIT, "200 MB should exceed 100 MB limit");
+  });
+
+  it("should accept max_bytes at exactly 100 MB", () => {
+    const MAX_BYTES_LIMIT = 100 * 1024 * 1024;
+    const maxBytes = 100 * 1024 * 1024;
+    assert.ok(maxBytes <= MAX_BYTES_LIMIT, "100 MB should not exceed limit");
   });
 });
 

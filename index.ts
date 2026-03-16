@@ -256,7 +256,7 @@ async function hubFetch(
   if (!acct.hubUrl || !acct.hubUrl.startsWith("http")) {
     throw new Error("HXA-Connect hubUrl not configured or invalid");
   }
-  const url = `${acct.hubUrl.replace(/\/$/, "")}${path}`;
+  const url = `${acct.hubUrl.replace(/\/+$/, "")}${path}`;
   const headers: Record<string, string> = {
     Authorization: `Bearer ${acct.agentToken}`,
     ...((init.headers as Record<string, string>) ?? {}),
@@ -1474,12 +1474,12 @@ Important: In threads, @mention the target bot in your message text (e.g. "@bot_
             "artifact-update",
             "artifact-list",
             "artifact-versions",
+            "download-file",
             "profile-update",
             "rename",
             "role",
             "ticket-create",
             "rotate-secret",
-            "download-file",
             "set-thread-mode",
             "show-thread-mode",
           ],
@@ -1895,12 +1895,22 @@ Important: In threads, @mention the target bot in your message text (e.g. "@bot_
             if (!params.file_id) {
               return errResult("file_id is required for download-file");
             }
-            const maxBytes = params.max_bytes ?? 10 * 1024 * 1024;
-            const dlTimeout = params.timeout ?? 30_000;
-            if (typeof maxBytes === "number" && (!Number.isFinite(maxBytes) || maxBytes <= 0)) {
+            const maxBytes = typeof params.max_bytes === "number"
+              ? params.max_bytes
+              : params.max_bytes != null ? Number(params.max_bytes)
+              : 10 * 1024 * 1024;
+            if (!Number.isFinite(maxBytes) || maxBytes <= 0) {
               return errResult("max_bytes must be a positive number");
             }
-            if (typeof dlTimeout === "number" && (!Number.isFinite(dlTimeout) || dlTimeout <= 0)) {
+            const MAX_BYTES_LIMIT = 100 * 1024 * 1024; // 100 MB
+            if (maxBytes > MAX_BYTES_LIMIT) {
+              return errResult(`max_bytes cannot exceed ${MAX_BYTES_LIMIT} (100 MB)`);
+            }
+            const dlTimeout = typeof params.timeout === "number"
+              ? params.timeout
+              : params.timeout != null ? Number(params.timeout)
+              : 30_000;
+            if (!Number.isFinite(dlTimeout) || dlTimeout <= 0) {
               return errResult("timeout must be a positive number (milliseconds)");
             }
 
@@ -1920,7 +1930,12 @@ Important: In threads, @mention the target bot in your message text (e.g. "@bot_
               savedPath = path.join(dlMediaDir, generateFilename(params.file_id, dlResult.contentType));
             }
 
-            await fs.promises.writeFile(savedPath, dlResult.buffer);
+            try {
+              await fs.promises.writeFile(savedPath, dlResult.buffer);
+            } catch (writeErr) {
+              await fs.promises.unlink(savedPath).catch(() => {});
+              throw writeErr;
+            }
 
             const baseUrl = (acct.hubUrl || "").replace(/\/+$/, "");
             result = {
@@ -1963,6 +1978,7 @@ Important: In threads, @mention the target bot in your message text (e.g. "@bot_
       } catch (err: any) {
         const errObj: any = { error: err.message || String(err) };
         if (err.status) errObj.status = err.status;
+        if (err.code) errObj.code = err.code;
         return {
           content: [{ type: "text", text: JSON.stringify(errObj, null, 2) }],
         };
