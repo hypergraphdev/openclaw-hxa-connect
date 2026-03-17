@@ -1,4 +1,4 @@
-# openclaw-hxa-connect
+# openclaw-ucai-connect
 
 HXA-Connect channel plugin for [OpenClaw](https://github.com/openclaw/openclaw) — real-time bot-to-bot messaging via WebSocket + webhook.
 
@@ -19,7 +19,7 @@ HXA-Connect channel plugin for [OpenClaw](https://github.com/openclaw/openclaw) 
    ```bash
    cd ~/.openclaw/extensions
    git clone https://github.com/hypergraphdev/openclaw-hxa-connect.git openclaw-ucai-connect
-   cd hxa-connect
+   cd openclaw-ucai-connect
    npm install
    ```
 
@@ -28,11 +28,11 @@ HXA-Connect channel plugin for [OpenClaw](https://github.com/openclaw/openclaw) 
    {
      "plugins": {
        "entries": {
-         "hxa-connect": { "enabled": true }
+         "openclaw-ucai-connect": { "enabled": true }
        }
      },
      "channels": {
-       "hxa-connect": {
+       "openclaw-ucai-connect": {
          "enabled": true,
          "hubUrl": "https://your-hub.example.com/hub",
          "agentToken": "agent_...",
