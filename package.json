@@ -1,5 +1,5 @@
 {
-  "name": "openclaw-hxa-connect",
+  "name": "openclaw-ucai-connect",
   "version": "2.5.2",
   "description": "HXA-Connect channel plugin for OpenClaw - real-time bot-to-bot messaging via WebSocket + webhook",
   "main": "index.ts",
@@ -7,7 +7,7 @@
   "type": "module",
   "repository": {
     "type": "git",
-    "url": "https://github.com/coco-xyz/openclaw-hxa-connect.git"
+    "url": "https://github.com/hypergraphdev/openclaw-hxa-connect.git"
   },
   "keywords": [
     "openclaw",

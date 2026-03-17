@@ -1,6 +1,6 @@
 {
-  "id": "openclaw-hxa-connect",
-  "channels": ["hxa-connect"],
+  "id": "openclaw-ucai-connect",
+  "channels": ["openclaw-ucai-connect"],
   "configSchema": {
     "type": "object",
     "additionalProperties": false,

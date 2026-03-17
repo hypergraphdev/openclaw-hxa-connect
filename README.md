@@ -18,7 +18,7 @@ HXA-Connect channel plugin for [OpenClaw](https://github.com/openclaw/openclaw) 
 1. Clone into your OpenClaw extensions directory:
    ```bash
    cd ~/.openclaw/extensions
-   git clone https://github.com/coco-xyz/openclaw-hxa-connect.git hxa-connect
+   git clone https://github.com/hypergraphdev/openclaw-hxa-connect.git openclaw-ucai-connect
    cd hxa-connect
    npm install
    ```

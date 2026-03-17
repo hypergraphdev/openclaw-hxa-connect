@@ -20,7 +20,7 @@ function getMediaDir(accountId: string): string {
     console.warn("[hxa-connect] runtime.dataDir is undefined, falling back to os.tmpdir()");
     _dataDirWarned = true;
   }
-  return path.join(os.tmpdir(), "openclaw-hxa-connect", "media", accountId);
+  return path.join(os.tmpdir(), "openclaw-ucai-connect", "media", accountId);
 }
 
 // ─── Types ───────────────────────────────────────────────────
@@ -63,8 +63,13 @@ interface HxaConnectChannelConfig {
   accounts?: Record<string, HxaAccountConfig>;
 }
 
+const HXA_CONNECT_CHANNEL_ID = "openclaw-ucai-connect";
+const LEGACY_HXA_CONNECT_CHANNEL_ID = "hxa-connect";
+
 function resolveHxaConnectConfig(cfg: any): HxaConnectChannelConfig {
-  return migrateHxaConnectConfig((cfg?.channels?.["hxa-connect"] ?? {}) as HxaConnectChannelConfig);
+  const channels = cfg?.channels ?? {};
+  const active = channels[HXA_CONNECT_CHANNEL_ID] ?? channels[LEGACY_HXA_CONNECT_CHANNEL_ID] ?? {};
+  return migrateHxaConnectConfig(active as HxaConnectChannelConfig);
 }
 
 function migrateAccessConfig(access: HxaAccessConfig | undefined): HxaAccessConfig | undefined {
@@ -131,11 +136,21 @@ function migrateHxaConnectConfig(hxa: HxaConnectChannelConfig): HxaConnectChanne
 function migrateRootConfig(cfg: any): { next: any; changed: boolean } {
   const next = structuredClone(cfg ?? {});
   next.channels = next.channels || {};
-  const before = JSON.stringify(next.channels["hxa-connect"] ?? {});
-  next.channels["hxa-connect"] = migrateHxaConnectConfig(
-    (next.channels["hxa-connect"] ?? {}) as HxaConnectChannelConfig,
-  );
-  const after = JSON.stringify(next.channels["hxa-connect"] ?? {});
+  const hasNew = !!next.channels[HXA_CONNECT_CHANNEL_ID];
+  const target = hasNew ? HXA_CONNECT_CHANNEL_ID : LEGACY_HXA_CONNECT_CHANNEL_ID;
+  const source = next.channels[target] ?? {};
+  const before = JSON.stringify(source);
+  const migrated = migrateHxaConnectConfig(source as HxaConnectChannelConfig);
+  const after = JSON.stringify(migrated);
+  if (before !== after) {
+    next.channels[target] = migrated;
+  }
+  if (!hasNew && !next.channels[HXA_CONNECT_CHANNEL_ID] && next.channels[LEGACY_HXA_CONNECT_CHANNEL_ID]) {
+    next.channels[HXA_CONNECT_CHANNEL_ID] = migrateHxaConnectConfig(
+      next.channels[LEGACY_HXA_CONNECT_CHANNEL_ID] as HxaConnectChannelConfig,
+    );
+    return { next, changed: true };
+  }
   return { next, changed: before !== after };
 }
 
@@ -189,8 +204,9 @@ async function setThreadModeInConfig(
 ): Promise<{ accountId: string; threadId: string; mode: "mention" | "smart" }> {
   const nextCfg = structuredClone(cfg ?? {});
   nextCfg.channels = nextCfg.channels || {};
-  nextCfg.channels["hxa-connect"] = nextCfg.channels["hxa-connect"] || {};
-  const hxa = nextCfg.channels["hxa-connect"];
+  const target = nextCfg.channels[HXA_CONNECT_CHANNEL_ID] ? HXA_CONNECT_CHANNEL_ID : LEGACY_HXA_CONNECT_CHANNEL_ID;
+  nextCfg.channels[target] = nextCfg.channels[target] || {};
+  const hxa = nextCfg.channels[target];
 
   if (hxa.accounts && Object.keys(hxa.accounts).length > 0) {
     const resolvedId = accountId || Object.keys(hxa.accounts)[0];
@@ -1023,7 +1039,7 @@ async function dispatchInbound(params: InboundParams) {
   const to = `hxa-connect:${accountId}`;
 
   const route = core.channel.routing.resolveAgentRoute({
-    channel: "hxa-connect",
+    channel: "openclaw-ucai-connect",
     from,
     chatType,
     groupSubject: chatType === "group" ? (groupSubject || replyTarget) : undefined,
@@ -1104,15 +1120,15 @@ async function dispatchInbound(params: InboundParams) {
 // ─── Channel Plugin ──────────────────────────────────────────
 
 const hxaConnectChannel = {
-  id: "hxa-connect" as const,
+  id: "openclaw-ucai-connect" as const,
   meta: {
-    id: "hxa-connect" as const,
+    id: "openclaw-ucai-connect" as const,
     label: "HXA-Connect",
     selectionLabel: "HXA-Connect (Agent-to-Agent)",
-    docsPath: "/channels/hxa-connect",
-    docsLabel: "hxa-connect",
+    docsPath: "/channels/openclaw-ucai-connect",
+    docsLabel: "openclaw-ucai-connect",
     blurb: "Agent-to-agent messaging via HXA-Connect with WebSocket + webhook support.",
-    aliases: ["hxa-connect", "hub"],
+    aliases: ["hxa-connect", "hub", "openclaw-ucai-connect"],
     order: 90,
   },
   capabilities: {
@@ -1173,7 +1189,7 @@ const hxaConnectChannel = {
       const result = await routeOutboundMessage(acct, params.to, params.text, {
         replyTo: params.replyToId,
       });
-      return { channel: "hxa-connect" as const, ...result };
+      return { channel: "openclaw-ucai-connect" as const, ...result };
     },
     sendMedia: async (params: {
       cfg: any;
@@ -1192,7 +1208,7 @@ const hxaConnectChannel = {
       const result = await routeOutboundMessage(acct, params.to, text, {
         replyTo: params.replyToId,
       });
-      return { channel: "hxa-connect" as const, ...result };
+      return { channel: "openclaw-ucai-connect" as const, ...result };
     },
   },
   gateway: {
@@ -2011,7 +2027,7 @@ function errResult(msg: string) {
 
 // ─── Plugin entry ────────────────────────────────────────────
 const plugin = {
-  id: "openclaw-hxa-connect",
+  id: "openclaw-ucai-connect",
   name: "HXA-Connect",
   description: "Agent-to-agent messaging via HXA-Connect (WebSocket + webhook)",
   configSchema: emptyPluginConfigSchema(),
@@ -2050,6 +2066,7 @@ const plugin = {
         api.registerHttpRoute({
           path: webhookPath,
           handler: handleInboundWebhook,
+          auth: "plugin", // compatibility: avoid strict gateway auth mismatch warnings
         });
         registeredPaths.add(webhookPath);
         api.logger.info(`hxa-connect: registered webhook route: ${webhookPath} (account: ${id})`);

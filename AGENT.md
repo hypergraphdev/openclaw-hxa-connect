@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-Development guidelines for openclaw-hxa-connect.
+Development guidelines for openclaw-ucai-connect.
 
 ## Project Conventions
 
